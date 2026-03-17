@@ -1,35 +1,41 @@
 """
-RAG PDF Local — Powered by Ollama + ChromaDB
+RAG Multi-Sources — PDF + Web + Markdown
+Powered by Groq + LangChain + ChromaDB
 """
 
 import os
+import requests
 from pathlib import Path
 
-from langchain_community.document_loaders import PyPDFLoader
+from langchain_community.document_loaders import (
+    PyPDFLoader,
+    UnstructuredMarkdownLoader,
+    WebBaseLoader
+)
 from langchain.text_splitter import RecursiveCharacterTextSplitter
-
-# from langchain_community.embeddings import OllamaEmbeddings
-from langchain_community.embeddings import HuggingFaceEmbeddings
-
-from langchain_community.vectorstores import Chroma
-
-#from langchain_community.llms import Ollama
+from langchain_huggingface import HuggingFaceEmbeddings
+from langchain_chroma import Chroma
 from langchain_groq import ChatGroq
-from dotenv import load_dotenv
-load_dotenv()
-
 from langchain.chains import RetrievalQA
 from langchain.prompts import PromptTemplate
+from dotenv import load_dotenv
 
-OLLAMA_MODEL       = os.getenv("OLLAMA_MODEL", "llama3")
-OLLAMA_BASE_URL    = os.getenv("OLLAMA_BASE_URL", "http://localhost:11434")
+load_dotenv()
+
+# ── Configuration ─────────────────────────────────────────────────────────────
+
+GROQ_MODEL         = os.getenv("GROQ_MODEL", "llama-3.3-70b-versatile")
 CHROMA_PERSIST_DIR = os.getenv("CHROMA_PERSIST_DIR", "./data/chroma")
 CHUNK_SIZE         = int(os.getenv("CHUNK_SIZE", "500"))
 CHUNK_OVERLAP      = int(os.getenv("CHUNK_OVERLAP", "50"))
+EMBEDDING_MODEL    = "all-MiniLM-L6-v2"
+
+# ── Prompt ────────────────────────────────────────────────────────────────────
 
 PROMPT_TEMPLATE = """
 Tu es un assistant expert. Réponds à la question en te basant UNIQUEMENT sur le contexte fourni.
 Si la réponse n'est pas dans le contexte, dis-le clairement.
+Indique toujours la source de ta réponse.
 
 Contexte :
 {context}
@@ -43,10 +49,38 @@ PROMPT = PromptTemplate(
     input_variables=["context", "question"]
 )
 
-def load_and_split_pdf(pdf_path: str) -> list:
-    print(f"📄 Chargement de : {pdf_path}")
-    loader = PyPDFLoader(pdf_path)
-    documents = loader.load()
+# ── Loaders ───────────────────────────────────────────────────────────────────
+
+def load_pdf(path: str, display_name: str = None) -> list:
+    print(f"📄 Chargement PDF : {path}")
+    docs = PyPDFLoader(path).load()
+    # Remplace le chemin temporaire par le vrai nom
+    if display_name:
+        for doc in docs:
+            doc.metadata["source"] = display_name
+    return docs
+
+def load_markdown(path: str) -> list:
+    print(f"📝 Chargement Markdown : {path}")
+    return UnstructuredMarkdownLoader(path).load()
+
+def load_url(url: str) -> list:
+    print(f"🌐 Chargement URL : {url}")
+    return WebBaseLoader(url).load()
+
+def detect_and_load(source: str, display_name: str = None) -> list:
+    if source.startswith("http://") or source.startswith("https://"):
+        return load_url(source)
+    elif source.endswith(".pdf"):
+        return load_pdf(source, display_name or source)
+    elif source.endswith(".md"):
+        return load_markdown(source)
+    else:
+        raise ValueError(f"Source non supportée : {source}")
+
+# ── Pipeline ──────────────────────────────────────────────────────────────────
+
+def split_documents(documents: list) -> list:
     splitter = RecursiveCharacterTextSplitter(
         chunk_size=CHUNK_SIZE,
         chunk_overlap=CHUNK_OVERLAP,
@@ -56,63 +90,107 @@ def load_and_split_pdf(pdf_path: str) -> list:
     print(f"✂️  {len(chunks)} chunks créés")
     return chunks
 
-def build_vectorstore(chunks: list) -> Chroma:
-    print(f"🔍 Création des embeddings avec Ollama ({OLLAMA_MODEL})...")
-    # embeddings = OllamaEmbeddings(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL)
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
+def get_embeddings():
+    return HuggingFaceEmbeddings(model_name=EMBEDDING_MODEL)
 
-    vectorstore = Chroma.from_documents(
-        documents=chunks,
-        embedding=embeddings,
-        persist_directory=CHROMA_PERSIST_DIR
+def build_vectorstore(chunks: list):
+    print(f"🔍 Début ingestion de {len(chunks)} chunks...")
+    import chromadb
+    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    
+    embeddings = get_embeddings()
+    collection = client.get_or_create_collection("langchain")
+    print(f"Collection avant ajout: {collection.count()} docs")
+    
+    texts = [chunk.page_content for chunk in chunks]
+    metadatas = [chunk.metadata for chunk in chunks]
+    ids = [str(i) for i in range(len(chunks))]
+    
+    print(f"Embedding {len(texts)} textes...")
+    embed_vectors = embeddings.embed_documents(texts)
+    print(f"Embeddings créés: {len(embed_vectors)}")
+    
+    collection.add(
+        documents=texts,
+        embeddings=embed_vectors,
+        metadatas=metadatas,
+        ids=ids
     )
-    vectorstore.persist()
-    print(f"💾 Vectorstore sauvegardé dans : {CHROMA_PERSIST_DIR}")
-    return vectorstore
+    print(f"Collection après ajout: {collection.count()} docs")
+    
+    return Chroma(
+        client=client,
+        collection_name="langchain",
+        embedding_function=embeddings
+    )
 
 def load_vectorstore() -> Chroma:
-    # embeddings = OllamaEmbeddings(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL)
-    embeddings = HuggingFaceEmbeddings(model_name="all-MiniLM-L6-v2")
-
-    return Chroma(persist_directory=CHROMA_PERSIST_DIR, embedding_function=embeddings)
+    import chromadb
+    client = chromadb.PersistentClient(path=CHROMA_PERSIST_DIR)
+    return Chroma(
+        client=client,
+        collection_name="langchain",
+        embedding_function=get_embeddings()
+    )
 
 def build_qa_chain(vectorstore: Chroma) -> RetrievalQA:
-    # llm = Ollama(model=OLLAMA_MODEL, base_url=OLLAMA_BASE_URL)
-    llm = ChatGroq(model="llama-3.3-70b-versatile", temperature=0)
-
+    llm = ChatGroq(model=GROQ_MODEL, temperature=0)
     retriever = vectorstore.as_retriever(search_kwargs={"k": 4})
     return RetrievalQA.from_chain_type(
         llm=llm,
         chain_type="stuff",
         retriever=retriever,
         return_source_documents=True,
-        chain_type_kwargs={"prompt": PROMPT}
+        chain_type_kwargs={"prompt": PROMPT},
+        verbose=True
     )
 
 def ask(chain: RetrievalQA, question: str) -> dict:
-    result = chain({"query": question})
+    # Test direct du retriever
+    docs = chain.retriever.get_relevant_documents(question)
+    print(f"DEBUG retriever: {len(docs)} docs trouvés")
+    for doc in docs:
+        print(f"DEBUG metadata: {doc.metadata}")
+    
+    result = chain.invoke({"query": question})
     sources = list({
-        doc.metadata.get("source", "?") + f" (p.{doc.metadata.get('page', '?')})"
-        for doc in result["source_documents"]
+        doc.metadata.get("source", "Source inconnue")
+        for doc in result.get("source_documents", [])
     })
     return {
         "question": question,
         "answer": result["result"].strip(),
-        "sources": sources
+        "sources": sources if sources else ["Sources non disponibles"]
     }
 
-def ingest(pdf_path: str):
-    if not Path(pdf_path).exists():
-        raise FileNotFoundError(f"PDF introuvable : {pdf_path}")
-    chunks = load_and_split_pdf(pdf_path)
-    build_vectorstore(chunks)
-    print("✅ Ingestion terminée !")
+# ── Ingest ────────────────────────────────────────────────────────────────────
+
+def ingest(sources: list, display_names: dict = None):
+    all_documents = []
+    for source in sources:
+        try:
+            name = display_names.get(source, source) if display_names else source
+            docs = detect_and_load(source, name)
+            all_documents.extend(docs)
+            print(f"✅ {len(docs)} pages chargées depuis : {name}")
+        except Exception as e:
+            print(f"❌ Erreur sur {source} : {e}")
+
+    if not all_documents:
+        raise ValueError("Aucun document chargé !")
+
+    chunks = split_documents(all_documents)
+    vectorstore = build_vectorstore(chunks)
+    print(f"\n🎉 Ingestion terminée ! {len(all_documents)} documents, {len(chunks)} chunks.")
+    return vectorstore  # ← retourne le vectorstore !
+
+# ── CLI ───────────────────────────────────────────────────────────────────────
 
 def chat():
     print("💬 Chargement du vectorstore...")
     vectorstore = load_vectorstore()
     chain = build_qa_chain(vectorstore)
-    print("\n🤖 RAG PDF Local — prêt ! (tape 'exit' pour quitter)\n")
+    print("\n🤖 RAG Multi-Sources — prêt ! (tape 'exit' pour quitter)\n")
     while True:
         question = input("Vous : ").strip()
         if question.lower() in ("exit", "quit", "q"):
@@ -125,16 +203,21 @@ def chat():
 
 if __name__ == "__main__":
     import sys
+
     if len(sys.argv) < 2:
         print("Usage:")
-        print("  python src/rag.py ingest <path/to/file.pdf>")
+        print("  python src/rag.py ingest <source1> <source2> ...")
         print("  python src/rag.py chat")
+        print("\nExemples:")
+        print("  python src/rag.py ingest doc.pdf https://example.com notes.md")
         sys.exit(1)
+
     command = sys.argv[1]
-    if command == "ingest" and len(sys.argv) == 3:
-        ingest(sys.argv[2])
+
+    if command == "ingest" and len(sys.argv) >= 3:
+        ingest(sys.argv[2:])
     elif command == "chat":
         chat()
     else:
-        print("Commande invalide. Utilise 'ingest <pdf>' ou 'chat'.")
+        print("Commande invalide.")
         sys.exit(1)
