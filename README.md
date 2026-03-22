@@ -1,6 +1,6 @@
 ---
-title: RAG PDF Cloud
-emoji: 📄
+title: RAG Multi-Sources
+emoji: 🔍
 colorFrom: blue
 colorTo: green
 sdk: docker
