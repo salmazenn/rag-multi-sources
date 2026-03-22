@@ -147,7 +147,7 @@ def build_qa_chain(vectorstore: Chroma) -> RetrievalQA:
 
 def ask(chain: RetrievalQA, question: str) -> dict:
     # Test direct du retriever
-    docs = chain.retriever.get_relevant_documents(question)
+    docs = chain.retriever.invoke(question)
     print(f"DEBUG retriever: {len(docs)} docs trouvés")
     for doc in docs:
         print(f"DEBUG metadata: {doc.metadata}")
